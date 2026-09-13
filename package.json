@@ -1,0 +1,27 @@
+{
+  "name": "continuum",
+  "version": "0.1.0",
+  "description": "Local, provider-neutral continuity runtime for AI coding agents.",
+  "type": "module",
+  "bin": {
+    "continuum": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "start": "tsx src/cli.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "yaml": "^2.5.0"
+  }
+}
