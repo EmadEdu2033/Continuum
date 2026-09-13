@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Continuum logo">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#a78bfa"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="#0b0f1a"/>
+  <path d="M30 84 C30 58 52 56 64 72 C76 88 98 88 98 64 C98 48 82 44 72 54"
+        fill="none" stroke="url(#g)" stroke-width="8" stroke-linecap="round"/>
+  <circle cx="72" cy="54" r="7" fill="#22d3ee"/>
+  <circle cx="30" cy="84" r="4" fill="#a78bfa"/>
+</svg>
