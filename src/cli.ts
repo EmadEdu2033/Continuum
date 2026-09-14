@@ -7,7 +7,12 @@ import { defaultConfig, loadConfig, writeConfig } from "./config.js";
 import { Store } from "./store.js";
 import { createCheckpoint } from "./checkpoint.js";
 import { Supervisor, fmtElapsed } from "./supervisor.js";
+import type { ContinuumConfig } from "./config.js";
 import { buildAdapters } from "./adapters/registry.js";
+import { Dashboard } from "./tui/app.js";
+import { isTty } from "./tui/term.js";
+import { compactTask } from "./compactor.js";
+import { semanticSearch } from "./memory.js";
 
 const pkg = createRequire(import.meta.url)("../package.json") as { version?: string; engines?: { node?: string } };
 const MIN_NODE = pkg.engines?.node ?? ">=23.4";
@@ -53,6 +58,81 @@ function printResultSummary(store: Store, result: { taskId: number; providerId: 
     console.log(`Next: continuum resume (retry) | switch <provider> (change starter) | logs (details)`);
   } else {
     console.log(`Next: continuum resume | continuum status`);
+  }
+}
+
+/**
+ * Runs a task and renders either the live dashboard (TTY) or plain logs.
+ * Shared by `run`, `start` and `resume`.
+ */
+async function executeRun(
+  root: string,
+  task: string,
+  config: ContinuumConfig,
+  opts: { mock: boolean; tui: boolean }
+): Promise<void> {
+  const store = new Store(root);
+  const started = Date.now();
+  const useTui = opts.tui && isTty();
+  const adapters = buildAdapters(root, config, { real: !opts.mock });
+  const providerViews = () => store.getProviders().map((p) => ({ id: p.id, state: p.state }));
+
+  let dashboard: Dashboard | null = null;
+  if (useTui) {
+    dashboard = new Dashboard({
+      project: config.project.name,
+      mode: opts.mock ? "mock" : "live",
+      onQuit: () => {
+        // The operator aborted: free the writer lock and stop cleanly.
+        try {
+          fs.rmSync(path.join(root, ".continuum", "workspace.lock"), { force: true });
+        } catch {
+          /* nothing to release */
+        }
+        console.log("\nAborted. Writer lock released. Resume later with: continuum resume");
+        process.exit(0);
+      },
+      onCheckpoint: () => {
+        const cp = createCheckpoint(store, root, "manual");
+        dashboard?.pushLog(`manual checkpoint #${cp.id} (${cp.filesChanged.length} files)`);
+        dashboard?.paint(true);
+      },
+      onHandoff: () => {
+        const file = path.join(store.handoffsDir, "latest.txt");
+        dashboard?.pushLog(fs.existsSync(file) ? fs.readFileSync(file, "utf8").split("\n")[0] : "(no handoff yet)");
+        dashboard?.paint(true);
+      },
+    });
+    dashboard.setProviders(providerViews());
+    dashboard.start();
+  }
+
+  const dash = dashboard;
+  const telemetry = dash
+    ? {
+        onLog: (line: string) => dash.pushLog(line),
+        onSnapshot: (s: any) => {
+          dash.update(s);
+          dash.setProviders(providerViews());
+        },
+      }
+    : { onLog: (line: string) => console.log(line) };
+
+  try {
+    const supervisor = new Supervisor(adapters, config, store, root, telemetry);
+    const result = await supervisor.run(task);
+    if (dash) {
+      dash.setFinished();
+      dash.paint(true);
+      await dash.waitForDone(8000);
+      dash.stop();
+    }
+    printResultSummary(store, result, Date.now() - started);
+  } catch (err) {
+    if (dash?.active) dash.stop();
+    throw err;
+  } finally {
+    store.close();
   }
 }
 
@@ -121,25 +201,13 @@ program
   .description("Run a task through the provider chain")
   .argument("<task>", "task description")
   .option("--mock", "run against mock providers instead of real CLIs")
+  .option("--no-tui", "plain log output instead of the live dashboard")
   .action(async (task: string, opts) => {
-    const root = projectRoot();
-    const store = new Store(root);
-    const started = Date.now();
     try {
-      const supervisor = new Supervisor(
-        buildAdapters(root, loadConfig(root), { real: !opts.mock }),
-        loadConfig(root),
-        store,
-        root,
-        { onLog: (line) => console.log(line) }
-      );
-      const result = await supervisor.run(task);
-      printResultSummary(store, result, Date.now() - started);
+      await executeRun(projectRoot(), task, loadConfig(projectRoot()), { mock: Boolean(opts.mock), tui: opts.tui !== false });
     } catch (err: any) {
       console.error(err?.message ?? String(err));
       process.exitCode = 1;
-    } finally {
-      store.close();
     }
   });
 
@@ -214,6 +282,38 @@ program
   });
 
 program
+  .command("search")
+  .description("Search durable memory and compacted task summaries")
+  .argument("<query>", "search terms")
+  .option("-n, --limit <n>", "max results", "8")
+  .action((query: string, opts) => {
+    const root = projectRoot();
+    const store = new Store(root);
+    const hits = semanticSearch(store, root, query, Number(opts.limit));
+    if (hits.length === 0) console.log("(no matches)");
+    for (const h of hits) console.log(`${h.source}: ${h.snippet}`);
+    store.close();
+  });
+
+program
+  .command("compact")
+  .description("Compact the latest task's event history into durable memory")
+  .action(() => {
+    const root = projectRoot();
+    const store = new Store(root);
+    const task = store.getActiveTask() ?? store.getLatestTask();
+    if (!task) {
+      console.log("No task to compact yet. Run one with `continuum start`.");
+      store.close();
+      return;
+    }
+    const c = compactTask(store, task.id);
+    console.log(`Task #${task.id}: compacted ${c.events} events (~${c.tokensBefore} → ~${c.tokensAfter} tokens).`);
+    console.log(`Summary stored. Next: continuum search "<query>" | continuum handoff`);
+    store.close();
+  });
+
+program
   .command("logs")
   .description("Tail the normalized event log")
   .option("-n, --lines <n>", "number of lines", "20")
@@ -228,6 +328,7 @@ program
   .command("resume")
   .description("Resume the paused active task")
   .option("--mock", "resume against mock providers instead of real CLIs")
+  .option("--no-tui", "plain log output instead of the live dashboard")
   .action(async (opts) => {
     const root = projectRoot();
     const store = new Store(root);
@@ -239,22 +340,12 @@ program
     }
     // The paused row is superseded by the fresh run's task row.
     store.updateTask(task.id, { status: "resumed" });
-    const started = Date.now();
+    store.close();
     try {
-      const supervisor = new Supervisor(
-        buildAdapters(root, loadConfig(root), { real: !opts.mock }),
-        loadConfig(root),
-        store,
-        root,
-        { onLog: (line) => console.log(line) }
-      );
-      const result = await supervisor.run(task.description);
-      printResultSummary(store, result, Date.now() - started);
+      await executeRun(root, task.description, loadConfig(root), { mock: Boolean(opts.mock), tui: opts.tui !== false });
     } catch (err: any) {
       console.error(err?.message ?? String(err));
       process.exitCode = 1;
-    } finally {
-      store.close();
     }
   });
 
@@ -310,24 +401,10 @@ program
       }
       console.log(`\nOrder: ${config.routing.order.join(" -> ")}`);
       console.log(`Running. On quota/limit: checkpoint + handoff capsule + next provider.\n`);
-      const store = new Store(root);
-      const started = Date.now();
-      try {
-        const supervisor = new Supervisor(
-          buildAdapters(root, config, { real: !opts.mock }),
-          config,
-          store,
-          root,
-          { onLog: (line) => console.log(line) }
-        );
-        const result = await supervisor.run(task);
-        printResultSummary(store, result, Date.now() - started);
-      } catch (err: any) {
-        console.error(err?.message ?? String(err));
-        process.exitCode = 1;
-      } finally {
-        store.close();
-      }
+      await executeRun(root, task, config, { mock: Boolean(opts.mock), tui: true });
+    } catch (err: any) {
+      console.error(err?.message ?? String(err));
+      process.exitCode = 1;
     } finally {
       rl.close();
     }
@@ -367,11 +444,12 @@ program
       const config = loadConfig(root);
       for (;;) {
         console.log(`\nOrder: ${config.routing.order.join(" -> ")}`);
+        console.log(`Routing mode: ${config.routing.mode}`);
         console.log(`Retries (transient failures): ${config.failover.temporary_rate_limit.max_attempts}`);
         for (const [id, v] of Object.entries(config.providers ?? {})) {
           if (v?.model) console.log(`Model ${id}: ${v.model}`);
         }
-        const choice = (await rl.question("\n1. Set starter provider  2. Set model  3. Set retries  4. Quit\n> ")).trim();
+        const choice = (await rl.question("\n1. Set starter provider  2. Set model  3. Set retries  4. Routing mode  5. Quit\n> ")).trim();
         if (choice === "1") {
           config.routing.order.forEach((p, i) => console.log(`  ${i + 1}. ${p}`));
           const n = parseInt((await rl.question("Start with? [number]\n> ")).trim(), 10);
@@ -396,6 +474,13 @@ program
             config.failover.temporary_rate_limit.max_attempts = n;
           } else {
             console.log("Out of range, unchanged.");
+          }
+        } else if (choice === "4") {
+          const mode = (await rl.question("Routing mode — ordered (verbatim) or smart (health-aware)? [ordered/smart]\n> ")).trim();
+          if (mode === "ordered" || mode === "smart") {
+            config.routing.mode = mode;
+          } else {
+            console.log("Unchanged (expected: ordered or smart).");
           }
         } else {
           break;

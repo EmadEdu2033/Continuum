@@ -5,7 +5,7 @@ import { parse } from "yaml";
 export interface ContinuumConfig {
   version: number;
   project: { name: string };
-  routing: { mode: "ordered"; order: string[] };
+  routing: { mode: "ordered" | "smart"; order: string[] };
   providers?: Partial<Record<string, { model?: string }>>;
   failover: {
     quota_exhausted: boolean;
@@ -18,7 +18,7 @@ export interface ContinuumConfig {
     checkpoint_interval_minutes: number;
     max_handoff_tokens: number;
   };
-  memory: { decisions: boolean; constraints: boolean; tasks: boolean; errors: boolean };
+  memory: { decisions: boolean; constraints: boolean; tasks: boolean; errors: boolean; semantic: boolean };
   workspace: { writer_lock: boolean };
 }
 
@@ -41,7 +41,7 @@ export function defaultConfig(projectName: string): ContinuumConfig {
       checkpoint_interval_minutes: 5,
       max_handoff_tokens: 12000,
     },
-    memory: { decisions: true, constraints: true, tasks: true, errors: true },
+    memory: { decisions: true, constraints: true, tasks: true, errors: true, semantic: true },
     workspace: { writer_lock: true },
   };
 }
@@ -103,6 +103,7 @@ memory:
   constraints: ${config.memory.constraints}
   tasks: ${config.memory.tasks}
   errors: ${config.memory.errors}
+  semantic: ${config.memory.semantic ?? true}
 workspace:
   writer_lock: ${config.workspace.writer_lock}
 `;

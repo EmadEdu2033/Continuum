@@ -36,11 +36,14 @@ describe("UX helpers", () => {
     store.close();
   });
 
-  it("empty routing fails with an actionable message", async () => {
+  it("empty routing fails with an actionable message and no phantom task", async () => {
     const store = new Store(root);
     const supervisor = new Supervisor(new Map(), defaultConfig("t"), store, root);
     await expect(supervisor.run("x")).rejects.toThrow(/continuum doctor/);
     await expect(supervisor.run("x")).rejects.toThrow(/mock-providers\.json/);
+    // A run that never started must not leave a task row for `resume` to pick.
+    expect(store.getLatestTask()).toBeUndefined();
+    expect(store.getActiveTask()).toBeUndefined();
     store.close();
   });
 

@@ -100,10 +100,15 @@ export interface AgentInput {
 }
 
 export class ContinuumError extends Error {
+  /** The original, un-prefixed message (used for normalized reporting). */
+  public readonly detail: string;
+
   constructor(
     public readonly code: NormalizedError,
     message: string
   ) {
     super(`[${code}] ${message}`);
+    this.detail = message;
+    this.name = "ContinuumError";
   }
 }

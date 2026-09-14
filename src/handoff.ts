@@ -19,8 +19,9 @@ export function buildHandoffCapsule(params: {
   reason: NormalizedError;
   checkpoint: CheckpointResult;
   maxTokens: number;
+  summary?: string;
 }): string {
-  const { store, projectId, task, taskId, fromProvider, reason, checkpoint, maxTokens } = params;
+  const { store, projectId, task, taskId, fromProvider, reason, checkpoint, maxTokens, summary } = params;
 
   const events = store.readEvents().filter((e) => e.taskId === taskId);
   const filesTouched = new Map<string, "created" | "modified" | "deleted">(); // provider-agnostic file map
@@ -39,6 +40,7 @@ export function buildHandoffCapsule(params: {
     `TASK\n${task}`,
     `HANDOFF\n#${store.nextHandoffId()} from ${fromProvider} (${reason}) at ${new Date().toISOString()}`,
     `CURRENT STATE\nCheckpoint #${checkpoint.id} captured. ${filesTouched.size} file(s) touched this session.`,
+    summary ? `SESSION SUMMARY (compacted)\n${summary}` : "",
     `FILES TOUCHED\n${[...filesTouched.entries()].map(([p, a]) => `${p} (${a})`).join("\n") || "(none)"}`,
     `GIT STATUS\n${checkpoint.gitStatus?.trim() || "(clean or no git)"}`,
     `DECISIONS\n${decisions || "(none recorded)"}`,
@@ -48,7 +50,7 @@ export function buildHandoffCapsule(params: {
     `NEXT ACTION\nInspect the current repository state first. Do not assume this summary is perfectly current. Continue the existing task rather than restarting it.`,
   ];
 
-  let capsule = sections.join("\n\n");
+  let capsule = sections.filter((s) => s && s.trim().length > 0).join("\n\n");
   // Rough token budget guard (~4 chars/token).
   const maxChars = maxTokens * 4;
   if (capsule.length > maxChars) {

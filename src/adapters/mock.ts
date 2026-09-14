@@ -69,7 +69,7 @@ export class MockProvider implements AgentAdapter {
 
   normalizeError(error: unknown): { code: import("../types.js").NormalizedError; message: string } {
     if (error instanceof ContinuumError) {
-      return { code: error.code, message: error.message };
+      return { code: error.code, message: error.detail };
     }
     return { code: "AGENT_CRASH", message: String(error) };
   }

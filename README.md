@@ -9,10 +9,10 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/EmadEdu2033/Continuum/actions/workflows/ci.yml"><img src="https://github.com/EmadEdu2033/Continuum/actions/workflows/ci.yml/badge.svg" alt="CI status" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT license" /></a>
   <img src="https://img.shields.io/badge/node-%3E%3D23.4-339933?logo=node.js&logoColor=white" alt="Node 23.4+" />
   <img src="https://img.shields.io/badge/platform-windows%20%7C%20linux%20%7C%20macos-blue" alt="Cross platform" />
+  <img src="https://img.shields.io/badge/tests-29%20passing-brightgreen" alt="Tests" />
   <img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs welcome" />
 </p>
 
@@ -47,7 +47,7 @@ cd my-project
 continuum init          # creates .continuum/ (config, memory, state dirs)
 continuum doctor        # which real CLIs are installed & authenticated
 
-# 3. Guided run — pick the starter, failover is automatic
+# 3. Guided run — pick the starter, then watch the live dashboard
 continuum start         # interactive: choose codex/claude/opencode/antigravity
 # or one-shot:
 continuum run "Build the authentication system and run all tests"
@@ -56,12 +56,43 @@ continuum run "Build the authentication system and run all tests"
 continuum status        # task + provider states + event count
 continuum handoff       # latest handoff capsule
 continuum logs          # normalized event log
+continuum search "auth" # search decisions + compacted task memory
+continuum compact       # fold the latest task history into memory
 continuum switch claude # start next run with claude
 continuum resume        # resume a paused task
-continuum config        # change order, models, retries without editing YAML
+continuum config        # change order, mode, models, retries — no YAML editing
 ```
 
 > Offline demo? Add `--mock` to `run` / `start` / `doctor` (needs scripted providers in `.continuum/mock-providers.json`).
+> Prefer plain logs? Add `--no-tui`.
+
+## 🖥️ Live dashboard
+
+`continuum start` (and `run` on a TTY) opens a full-screen dashboard:
+
+```text
+┌─ CONTINUUM · continuity runtime                        futureteach [live] ─┐
+│ ⠹ claude step 2/4 run 02:05 active 00:45     files 7  cmds 3  caps 1      │
+┌─ Providers ───────────────────┐  ┌─ Context ────────────────────────────┐
+│ ◌ codex        EXHAUSTED      │  │ Task       Build the authentication…  │
+│ ◉ claude       ACTIVE ◀ write │  │ Progress   ██████░░░░░░░░░ 25%        │
+│ ● opencode     READY          │  │ Checkpoint #4                         │
+│ ● antigravity  READY          │  │                                      │
+└───────────────────────────────┘  └──────────────────────────────────────┘
+┌─ Handoff chain ───────────────────────────────────────────────────────────┐
+│  codex → claude → opencode → antigravity                                  │
+└───────────────────────────────────────────────────────────────────────────┘
+┌─ Live ────────────────────────────────────────────────────────────────────┐
+│ codex failed: [QUOTA_EXHAUSTED] usage limit reached                       │
+│ Checkpoint #4 created.                                                    │
+│ Handoff capsule #1 created. Transferring to next provider...              │
+│ claude is now the active writer (2/4).                                    │
+└───────────────────────────────────────────────────────────────────────────┘
+└─ q quit  s switch  h handoff  c checkpoint                       running ─┘
+```
+
+Keys: `c` checkpoint · `h` peek at the latest handoff · `q`/`Ctrl+C` abort (frees the writer lock).
+Zero dependencies — hand-rolled ANSI, so it works on Windows Terminal, PowerShell 7, Linux and macOS.
 
 ## 🧠 How it works
 
@@ -105,15 +136,27 @@ Uninstalled providers are skipped automatically (preflight `detect()`), never fa
 | `QUOTA_EXHAUSTED` / `PROVIDER_UNAVAILABLE` | checkpoint → handoff capsule → next provider |
 | `TEMP_RATE_LIMIT` / `NETWORK_FAILURE` | retry with backoff (configurable), then next provider |
 | `AUTH_REQUIRED` / `USER_CANCELLED` | pause task (`continuum resume` later) |
-| `CONTEXT_EXHAUSTED` | mark provider, pause (compaction on roadmap) |
+| `CONTEXT_EXHAUSTED` | compact context → handoff capsule → next provider |
 | `AGENT_CRASH` | pause, recover from latest checkpoint |
+
+## 🧭 Routing
+
+`routing.mode` in `.continuum/config.yaml` (or via `continuum config`):
+
+- **`ordered`** (default) — follow the configured list verbatim. Predictable.
+- **`smart`** — keep the configured list as the tie-breaker, but demote providers that are on cooldown or have failed recently, and skip ones that are exhausted/unavailable. Deterministic (no clocks, no randomness).
+
+## 🧩 Context & memory
+
+- **Compactor** — `CONTEXT_EXHAUSTED` (and every handoff) folds raw events into a bounded, hierarchical summary: raw events → per-session summaries → task memory. Deterministic, so it is safe inside the control path.
+- **Semantic memory** — durable memory files and compacted summaries are indexed in **SQLite FTS5** and searched with BM25 via `continuum search "<query>"`. No vector database, no external calls; falls back to `LIKE` if FTS5 is unavailable.
 
 ## 📁 `.continuum/` layout
 
 ```text
 .continuum/
   config.yaml          routing order, failover rules, provider options
-  state.db             SQLite: tasks, providers, checkpoints
+  state.db             SQLite: tasks, providers, checkpoints, summaries, FTS index
   events.ndjson        append-only normalized event log
   project.md  decisions.md  constraints.md   durable human-readable memory
   current-task.json    quick-look task state
@@ -139,17 +182,17 @@ Uninstalled providers are skipped automatically (preflight `detect()`), never fa
 - [x] Checkpoints + system-generated handoff capsules
 - [x] Codex / Claude / OpenCode / Antigravity adapters
 - [x] Retry with backoff, preflight skip, mock mode
-- [ ] Hierarchical context compactor
-- [ ] Smart routing (beyond fixed order)
-- [ ] Full-screen TUI
-- [ ] Optional semantic memory index
+- [x] Hierarchical context compactor
+- [x] Smart routing (health-aware, deterministic)
+- [x] Full-screen live TUI (zero-dependency ANSI)
+- [x] Semantic memory (SQLite FTS5 BM25 + LIKE fallback)
 
 ## 🤝 Contributing
 
 PRs welcome! Run the checks before pushing:
 
 ```bash
-npm run build && npm test   # 20 tests, must stay green
+npm run build && npm test   # 29 tests, must stay green
 ```
 
 Keep adapters isolated (no provider logic in core) and add a regression test with every failover fix.

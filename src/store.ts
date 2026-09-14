@@ -14,6 +14,7 @@ export class Store {
   readonly checkpointsDir: string;
   readonly sessionsDir: string;
   private db: InstanceType<typeof DatabaseSync>;
+  private ftsEnabled = false;
 
   constructor(projectRoot: string) {
     this.root = path.join(projectRoot, ".continuum");
@@ -51,7 +52,25 @@ export class Store {
         files_changed TEXT,
         created_at TEXT
       );
+      CREATE TABLE IF NOT EXISTS summaries (
+        task_id INTEGER PRIMARY KEY,
+        text TEXT NOT NULL,
+        created_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS provider_failures (
+        id TEXT PRIMARY KEY,
+        count INTEGER NOT NULL DEFAULT 0,
+        last_at TEXT
+      );
     `);
+    // FTS5 makes retrieval ranked and cheap; fall back to LIKE if unavailable.
+    try {
+      this.db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(source UNINDEXED, content);`);
+      this.ftsEnabled = true;
+    } catch {
+      this.ftsEnabled = false;
+      this.db.exec(`CREATE TABLE IF NOT EXISTS memory_docs (source TEXT, content TEXT);`);
+    }
   }
 
   setProviderState(id: string, state: string, extra?: { sessionId?: string | null; availableAt?: string | null }) {
@@ -164,6 +183,78 @@ export class Store {
     } catch {
       return null;
     }
+  }
+
+  // ── Context compaction ────────────────────────────────────────────────
+  saveSummary(taskId: number, text: string) {
+    this.db
+      .prepare(
+        `INSERT INTO summaries (task_id, text, created_at) VALUES (?, ?, ?)
+         ON CONFLICT(task_id) DO UPDATE SET text = excluded.text, created_at = excluded.created_at`
+      )
+      .run(taskId, text, new Date().toISOString());
+  }
+
+  getSummary(taskId: number): string | null {
+    const row = this.db.prepare(`SELECT text FROM summaries WHERE task_id = ?`).get(taskId) as { text?: string } | undefined;
+    return row?.text ?? null;
+  }
+
+  getAllSummaries(): Array<{ task_id: number; text: string }> {
+    return this.db.prepare(`SELECT task_id, text FROM summaries ORDER BY task_id`).all() as any;
+  }
+
+  // ── Smart routing signal ──────────────────────────────────────────────
+  recordFailure(providerId: string) {
+    this.db
+      .prepare(
+        `INSERT INTO provider_failures (id, count, last_at) VALUES (?, 1, ?)
+         ON CONFLICT(id) DO UPDATE SET count = count + 1, last_at = excluded.last_at`
+      )
+      .run(providerId, new Date().toISOString());
+  }
+
+  resetFailures(providerId: string) {
+    this.db.prepare(`UPDATE provider_failures SET count = 0 WHERE id = ?`).run(providerId);
+  }
+
+  getFailureCounts(): Map<string, number> {
+    const rows = this.db.prepare(`SELECT id, count FROM provider_failures`).all() as Array<{ id: string; count: number }>;
+    return new Map(rows.map((r) => [r.id, r.count]));
+  }
+
+  // ── Optional semantic retrieval (FTS5 BM25; LIKE fallback) ────────────
+  reindexMemory(docs: Array<{ source: string; content: string }>) {
+    const table = this.ftsEnabled ? "memory_fts" : "memory_docs";
+    this.db.exec(`DELETE FROM ${table}`);
+    const stmt = this.db.prepare(`INSERT INTO ${table} (source, content) VALUES (?, ?)`);
+    for (const d of docs) stmt.run(d.source, d.content);
+  }
+
+  searchMemory(query: string, limit = 8): Array<{ source: string; snippet: string }> {
+    if (this.ftsEnabled) {
+      const terms = query.split(/\s+/).filter(Boolean).map((t) => `"${t.replace(/"/g, "")}"`);
+      if (terms.length === 0) return [];
+      try {
+        const rows = this.db
+          .prepare(
+            `SELECT source, snippet(memory_fts, 1, '«', '»', '…', 10) AS snip
+             FROM memory_fts WHERE memory_fts MATCH ? ORDER BY bm25(memory_fts) LIMIT ?`
+          )
+          .all(terms.join(" OR "), limit) as Array<{ source: string; snip: string }>;
+        return rows.map((r) => ({ source: r.source, snippet: r.snip }));
+      } catch {
+        /* fall through to LIKE */
+      }
+    }
+    const rows = this.db
+      .prepare(`SELECT source, content FROM memory_docs WHERE content LIKE ? LIMIT ?`)
+      .all(`%${query}%`, limit) as Array<{ source: string; content: string }>;
+    return rows.map((r) => ({ source: r.source, snippet: r.content.slice(0, 200) }));
+  }
+
+  get fts(): boolean {
+    return this.ftsEnabled;
   }
 
   close() {
