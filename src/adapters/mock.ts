@@ -54,6 +54,7 @@ export class MockProvider implements AgentAdapter {
   }
 
   async *start(input: AgentInput): AsyncIterable<AgentEvent> {
+    this.sessionId = null; // fresh session gets a fresh id
     yield* this.runScript(input);
   }
 
@@ -79,7 +80,9 @@ export class MockProvider implements AgentAdapter {
 
   private async *runScript(input: AgentInput): AsyncIterable<AgentEvent> {
     const at = () => new Date().toISOString();
-    this.sessionId = `${this.config.id}-${Date.now().toString(36)}`;
+    if (!this.sessionId) {
+      this.sessionId = `${this.config.id}-${Date.now().toString(36)}`;
+    }
     this.interrupted = false;
 
     yield { type: "SessionStarted", sessionId: this.sessionId, providerId: this.config.id, at: at() };

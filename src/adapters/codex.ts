@@ -9,7 +9,6 @@ import type { AgentEvent, AgentInput } from "../types.js";
 import { ContinuumError } from "../types.js";
 import { classifyError } from "../errors.js";
 import {
-  resolveBinary,
   findOnPath,
   spawnCli,
   type CliRunHandle,
@@ -32,14 +31,16 @@ export class CodexAdapter implements AgentAdapter {
 
   private bin(): string {
     const local = process.env.LOCALAPPDATA;
-    return (
-      resolveBinary([
-        local ? path.join(local, "Programs", "OpenAI", "Codex", "bin", "codex.exe") : "",
-        "/usr/local/bin/codex",
-        "/usr/bin/codex",
-        "codex",
-      ]) ?? "codex"
-    );
+    const direct = local
+      ? path.join(local, "Programs", "OpenAI", "Codex", "bin", "codex.exe")
+      : "";
+    try {
+      fs.accessSync(direct);
+      return direct;
+    } catch {
+      /* fall through to PATH */
+    }
+    return findOnPath("codex") ?? "codex";
   }
 
   async detect(): Promise<boolean> {
@@ -54,6 +55,31 @@ export class CodexAdapter implements AgentAdapter {
   async health(): Promise<ProviderHealth> {
     const installed = await this.detect();
     return { installed, authenticated: installed, state: installed ? "READY" : "UNAVAILABLE" };
+  }
+
+  /**
+   * Verified probe: `codex login status` exits 0 with "Logged in ..."
+   * when authenticated. Never throws — returns null when unverifiable.
+   */
+  async checkAuth(): Promise<{ ok: boolean; detail: string } | null> {
+    try {
+      const { execFile } = await import("node:child_process");
+      const out = await new Promise<string>((resolve, reject) => {
+        execFile(this.bin(), ["login", "status"], { timeout: 20000 }, (err, stdout, stderr) => {
+          const text = `${stdout ?? ""}${stderr ?? ""}`;
+          if (err) reject(new Error(text.trim() || err.message));
+          else resolve(text);
+        });
+      });
+      const ok = /logged in/i.test(out) && !/not logged in/i.test(out);
+      return { ok, detail: ok ? out.trim().slice(0, 120) : "login status did not confirm authentication" };
+    } catch (err: any) {
+      const text = String(err?.message ?? err);
+      if (/not logged in|not authenticated|login required/i.test(text)) {
+        return { ok: false, detail: text.slice(0, 200) };
+      }
+      return null;
+    }
   }
 
   async *start(input: AgentInput): AsyncIterable<AgentEvent> {

@@ -2,17 +2,58 @@
 import { Command } from "commander";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createRequire } from "node:module";
 import { defaultConfig, loadConfig, writeConfig } from "./config.js";
 import { Store } from "./store.js";
 import { createCheckpoint } from "./checkpoint.js";
-import { Supervisor } from "./supervisor.js";
+import { Supervisor, fmtElapsed } from "./supervisor.js";
 import { buildAdapters } from "./adapters/registry.js";
 
+const pkg = createRequire(import.meta.url)("../package.json") as { version?: string; engines?: { node?: string } };
+const MIN_NODE = pkg.engines?.node ?? ">=23.4";
+
 const program = new Command();
-program.name("continuum").description("Provider-neutral continuity runtime for AI coding agents").version("0.1.0");
+program.name("continuum").description("Provider-neutral continuity runtime for AI coding agents").version(pkg.version ?? "0.1.0");
 
 function projectRoot(): string {
   return process.cwd();
+}
+
+const LOGIN_HINTS: Record<string, string> = {
+  codex: "codex login",
+  claude: "claude login",
+};
+
+function loginHint(id: string): string {
+  return LOGIN_HINTS[id] ?? `authenticate ${id} (see its own docs)`;
+}
+
+function lastAgentError(store: Store): { error: string; message: string } | null {
+  const events = store.readEvents();
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i] as any;
+    if (e?.type === "AgentError") return { error: e.error, message: e.message };
+  }
+  return null;
+}
+
+function printResultSummary(store: Store, result: { taskId: number; providerId: string; status: string }, elapsedMs: number): void {
+  const cp = store.getLatestCheckpoint();
+  const handoffPath = path.join(store.handoffsDir, "latest.txt");
+  const hasHandoff = fs.existsSync(handoffPath);
+  console.log(`\n────────────────────────`);
+  console.log(`Result: ${result.status} in ${fmtElapsed(elapsedMs)} (last provider: ${result.providerId})`);
+  console.log(`Checkpoint: ${cp ? `#${cp.id}` : "(none)"}   Handoff: ${hasHandoff ? "latest.txt" : "(none needed)"}`);
+  const err = result.status === "exhausted" ? lastAgentError(store) : null;
+  if (result.status === "completed") {
+    console.log(`Next: handoff (review capsule) | logs (transcript) | start (new task)`);
+  } else if (err?.error === "AUTH_REQUIRED") {
+    console.log(`Next: ${loginHint(result.providerId)}, then: continuum resume`);
+  } else if (err) {
+    console.log(`Next: continuum resume (retry) | switch <provider> (change starter) | logs (details)`);
+  } else {
+    console.log(`Next: continuum resume | continuum status`);
+  }
 }
 
 program
@@ -32,22 +73,47 @@ program
       "utf8"
     );
     console.log(`Continuum initialized in ${cdir}`);
+    console.log(`Next:`);
+    console.log(`  continuum doctor        check which provider CLIs are installed & logged in`);
+    console.log(`  continuum start         guided run — pick the starter, failover is automatic`);
+    console.log(`  continuum run "<task>"  one-shot run without prompts`);
   });
 
 program
   .command("doctor")
-  .description("Check provider availability")
+  .description("Check provider availability and login state")
   .option("--mock", "check mock providers instead of real CLIs")
   .action(async (opts) => {
+    const [major, minor] = process.version.replace("v", "").split(".").map(Number);
+    const nodeOk = major > 23 || (major === 23 && minor >= 4);
+    console.log(`node ${process.version} (needs ${MIN_NODE})${nodeOk ? "" : "  <-- UPGRADE NODE"}`);
     const root = projectRoot();
-    const adapters = buildAdapters(root, loadConfig(root), { real: !opts.mock });
+    const config = loadConfig(root);
+    const adapters = buildAdapters(root, config, { real: !opts.mock });
+    if (adapters.size === 0) {
+      console.log(
+        opts.mock
+          ? "No mock scripts found. Add providers to `.continuum/mock-providers.json` (see README) or run without --mock."
+          : "No providers configured. Check `.continuum/config.yaml` routing order."
+      );
+      return;
+    }
     for (const [id, adapter] of adapters) {
       const installed = await adapter.detect();
-      const health = await adapter.health();
-      console.log(
-        `${id.padEnd(14)} installed=${installed} auth=${health.authenticated} state=${health.state} version=${health.version ?? "?"}`
-      );
+      if (!installed) {
+        console.log(`${id.padEnd(14)} installed=no  auth=no (${loginHint(id)} to set up)`);
+        continue;
+      }
+      const probe = await adapter.checkAuth?.() ?? null;
+      if (probe === null) {
+        console.log(`${id.padEnd(14)} installed=yes auth=? (verified automatically on first run)`);
+      } else if (probe.ok) {
+        console.log(`${id.padEnd(14)} installed=yes auth=yes (${probe.detail})`);
+      } else {
+        console.log(`${id.padEnd(14)} installed=yes auth=NO (${probe.detail}) -> run: ${loginHint(id)}`);
+      }
     }
+    console.log(`Next: continuum start (guided run) | continuum run "<task>"`);
   });
 
 program
@@ -58,6 +124,7 @@ program
   .action(async (task: string, opts) => {
     const root = projectRoot();
     const store = new Store(root);
+    const started = Date.now();
     try {
       const supervisor = new Supervisor(
         buildAdapters(root, loadConfig(root), { real: !opts.mock }),
@@ -67,7 +134,7 @@ program
         { onLog: (line) => console.log(line) }
       );
       const result = await supervisor.run(task);
-      console.log(`\nResult: ${result.status} (last provider: ${result.providerId})`);
+      printResultSummary(store, result, Date.now() - started);
     } catch (err: any) {
       console.error(err?.message ?? String(err));
       process.exitCode = 1;
@@ -82,14 +149,26 @@ program
   .action(() => {
     const root = projectRoot();
     const store = new Store(root);
-    const task = store.getActiveTask();
-    console.log("Task:", task ? `${task.id}: ${task.description} (${task.status}, provider=${task.current_provider})` : "(none)");
+    const active = store.getActiveTask();
+    if (active) {
+      console.log(`Task: #${active.id} "${active.description}" (${active.status}, provider=${active.current_provider ?? "?"})`);
+      if (active.status === "paused") console.log(`  -> resume with: continuum resume`);
+    } else {
+      const last = store.getLatestTask();
+      console.log(
+        last
+          ? `Task: #${last.id} "${last.description}" (${last.status}, provider=${last.current_provider ?? "?"})`
+          : `Task: (no tasks yet — run: continuum start)`
+      );
+    }
     for (const p of store.getProviders()) {
       console.log(`${p.id.padEnd(14)} ${p.state}${p.available_at ? ` (available at ${p.available_at})` : ""}`);
     }
     const events = store.readEvents();
     const cp = store.getLatestCheckpoint();
-    console.log(`Events: ${events.length}  Latest checkpoint: ${cp ? `#${cp.id}` : "(none)"}`);
+    const handoffs = fs.readdirSync(store.handoffsDir).filter((f) => f.endsWith(".txt") && f !== "latest.txt").length;
+    console.log(`Events: ${events.length}  Checkpoints: ${cp ? `latest #${cp.id}` : "(none)"}  Handoffs: ${handoffs}`);
+    if (!active) console.log(`Next: continuum start (new task) | continuum logs (history)`);
     store.close();
   });
 
@@ -110,6 +189,7 @@ program
     const store = new Store(root);
     const cp = createCheckpoint(store, root, "manual");
     console.log(`Checkpoint #${cp.id} created (${cp.filesChanged.length} changed files).`);
+    console.log(`Next: continuum handoff (if you switch providers) | continuum logs`);
     store.close();
   });
 
@@ -159,6 +239,7 @@ program
     }
     // The paused row is superseded by the fresh run's task row.
     store.updateTask(task.id, { status: "resumed" });
+    const started = Date.now();
     try {
       const supervisor = new Supervisor(
         buildAdapters(root, loadConfig(root), { real: !opts.mock }),
@@ -168,7 +249,7 @@ program
         { onLog: (line) => console.log(line) }
       );
       const result = await supervisor.run(task.description);
-      console.log(`\nResult: ${result.status}`);
+      printResultSummary(store, result, Date.now() - started);
     } catch (err: any) {
       console.error(err?.message ?? String(err));
       process.exitCode = 1;
@@ -189,14 +270,30 @@ program
       const root = projectRoot();
       const config = loadConfig(root);
       const adapters = buildAdapters(root, config, { real: !opts.mock });
+      if (adapters.size === 0) {
+        console.log(
+          opts.mock
+            ? "No mock scripts found. Add providers to `.continuum/mock-providers.json` first (see README), or run `continuum start` without --mock."
+            : "No providers available. Run `continuum doctor` to check installs."
+        );
+        return;
+      }
       console.log("\n=== CONTINUUM ===  Agent can stop. Context doesn't.\n");
       console.log("Providers (checked now, no tokens spent on standby):");
       const rows: Array<{ id: string; ok: boolean }> = [];
       for (const id of config.routing.order) {
         const a = adapters.get(id);
-        const ok = a ? await a.detect() : false;
+        if (!a) {
+          console.log(`  -. ${id.padEnd(12)} ${opts.mock ? "NO MOCK SCRIPT (skipped)" : "NOT CONFIGURED (skipped)"}`);
+          continue;
+        }
+        const ok = await a.detect();
         rows.push({ id, ok });
-        console.log(`  ${rows.length}. ${id.padEnd(12)} ${ok ? "READY" : "NOT INSTALLED"}`);
+        console.log(`  ${rows.length}. ${id.padEnd(12)} ${ok ? "READY" : "NOT INSTALLED (auto-skipped)"}`);
+      }
+      if (rows.length === 0) {
+        console.log("Nothing to run with. Fix the list above, then try again.");
+        return;
       }
       const task = (await rl.question("\nTask? (e.g. Build auth and test it)\n> ")).trim();
       if (!task) {
@@ -214,6 +311,7 @@ program
       console.log(`\nOrder: ${config.routing.order.join(" -> ")}`);
       console.log(`Running. On quota/limit: checkpoint + handoff capsule + next provider.\n`);
       const store = new Store(root);
+      const started = Date.now();
       try {
         const supervisor = new Supervisor(
           buildAdapters(root, config, { real: !opts.mock }),
@@ -223,8 +321,10 @@ program
           { onLog: (line) => console.log(line) }
         );
         const result = await supervisor.run(task);
-        console.log(`\nResult: ${result.status} (last provider: ${result.providerId})`);
-        console.log(`Next: status | handoff | logs | resume`);
+        printResultSummary(store, result, Date.now() - started);
+      } catch (err: any) {
+        console.error(err?.message ?? String(err));
+        process.exitCode = 1;
       } finally {
         store.close();
       }
@@ -247,6 +347,65 @@ program
     config.routing.order = [provider, ...config.routing.order.filter((p) => p !== provider)];
     writeConfig(root, config);
     console.log(`Routing order is now: ${config.routing.order.join(" -> ")}`);
+    console.log(`Next: continuum start (guided run) | continuum run "<task>"`);
+  });
+
+program
+  .command("config")
+  .description("View or change routing, models and retries without editing YAML")
+  .option("--show", "print the current config and exit")
+  .action(async (opts) => {
+    const root = projectRoot();
+    if (opts.show) {
+      console.log(fs.readFileSync(path.join(root, ".continuum", "config.yaml"), "utf8"));
+      return;
+    }
+    const { createInterface } = await import("node:readline/promises");
+    const { stdin: input, stdout: output } = await import("node:process");
+    const rl = createInterface({ input, output });
+    try {
+      const config = loadConfig(root);
+      for (;;) {
+        console.log(`\nOrder: ${config.routing.order.join(" -> ")}`);
+        console.log(`Retries (transient failures): ${config.failover.temporary_rate_limit.max_attempts}`);
+        for (const [id, v] of Object.entries(config.providers ?? {})) {
+          if (v?.model) console.log(`Model ${id}: ${v.model}`);
+        }
+        const choice = (await rl.question("\n1. Set starter provider  2. Set model  3. Set retries  4. Quit\n> ")).trim();
+        if (choice === "1") {
+          config.routing.order.forEach((p, i) => console.log(`  ${i + 1}. ${p}`));
+          const n = parseInt((await rl.question("Start with? [number]\n> ")).trim(), 10);
+          if (n >= 1 && n <= config.routing.order.length) {
+            const first = config.routing.order[n - 1];
+            config.routing.order = [first, ...config.routing.order.filter((p) => p !== first)];
+          } else {
+            console.log("Out of range, order unchanged.");
+          }
+        } else if (choice === "2") {
+          const id = (await rl.question(`Provider id (${config.routing.order.join("/")})?\n> `)).trim();
+          if (!config.routing.order.includes(id)) {
+            console.log(`Unknown provider "${id}".`);
+            continue;
+          }
+          const model = (await rl.question("Model (empty = CLI default, clears override)?\n> ")).trim();
+          config.providers = { ...config.providers, [id]: model ? { model } : {} };
+          console.log(model ? `Model for ${id}: ${model}` : `Model override for ${id} cleared.`);
+        } else if (choice === "3") {
+          const n = parseInt((await rl.question("Retry attempts for transient failures? [0-10]\n> ")).trim(), 10);
+          if (Number.isInteger(n) && n >= 0 && n <= 10) {
+            config.failover.temporary_rate_limit.max_attempts = n;
+          } else {
+            console.log("Out of range, unchanged.");
+          }
+        } else {
+          break;
+        }
+        writeConfig(root, config);
+        console.log("Saved.");
+      }
+    } finally {
+      rl.close();
+    }
   });
 
 function summarize(e: any): string {

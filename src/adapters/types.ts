@@ -13,11 +13,18 @@ export interface SessionState {
   lastActiveAt: string | null;
 }
 
+export interface AuthCheck {
+  ok: boolean;
+  detail: string;
+}
+
 export interface AgentAdapter {
   id: string;
   /** Best-effort detection that the provider CLI exists. */
   detect(): Promise<boolean>;
   health(): Promise<ProviderHealth>;
+  /** Best-effort login probe. `null` = cannot verify without a real run. Never throws. */
+  checkAuth?(): Promise<AuthCheck | null>;
   start(input: AgentInput): AsyncIterable<AgentEvent>;
   resume(sessionId: string, input: AgentInput): AsyncIterable<AgentEvent>;
   interrupt(): Promise<void>;

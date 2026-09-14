@@ -48,11 +48,13 @@ export function buildAdapters(
     return adapters;
   }
 
-  // Mock mode (tests / offline demos).
+  // Mock mode (tests / offline demos). Only providers with an explicit mock
+  // script participate — an unscripted mock that "completes" tasks while
+  // doing nothing would fake success.
   const mockConfigs = loadMockConfig(root);
   for (const id of config.routing.order) {
     const found = mockConfigs.find((m) => m.id === id);
-    adapters.set(id, found ? new MockProvider(found) : new MockProvider({ id, script: [{ kind: "say", text: "mock provider idle" }] }));
+    if (found) adapters.set(id, new MockProvider(found));
   }
   return adapters;
 }

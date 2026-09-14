@@ -105,6 +105,11 @@ export class Store {
       .get();
   }
 
+  /** Most recent task of any status — for `status` after a task finished. */
+  getLatestTask(): any {
+    return this.db.prepare(`SELECT * FROM tasks ORDER BY id DESC LIMIT 1`).get();
+  }
+
   saveCheckpoint(providerId: string, gitStatus: string, gitDiff: string, filesChanged: string[]): number {
     const res = this.db
       .prepare(

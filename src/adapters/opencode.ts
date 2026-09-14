@@ -9,7 +9,6 @@ import type { AgentEvent, AgentInput } from "../types.js";
 import { ContinuumError } from "../types.js";
 import { classifyError } from "../errors.js";
 import {
-  resolveBinary,
   findOnPath,
   spawnCli,
   type CliRunHandle,
@@ -35,14 +34,16 @@ export class OpenCodeAdapter implements AgentAdapter {
 
   private bin(): string {
     const appData = process.env.APPDATA;
-    return (
-      resolveBinary([
-        appData ? path.join(appData, "npm", "node_modules", "opencode-ai", "bin", "opencode.exe") : "",
-        "/usr/local/bin/opencode",
-        "/usr/bin/opencode",
-        "opencode",
-      ]) ?? "opencode"
-    );
+    const direct = appData
+      ? path.join(appData, "npm", "node_modules", "opencode-ai", "bin", "opencode.exe")
+      : "";
+    try {
+      fs.accessSync(direct);
+      return direct;
+    } catch {
+      /* fall through to PATH */
+    }
+    return findOnPath("opencode") ?? "opencode";
   }
 
   async detect(): Promise<boolean> {

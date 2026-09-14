@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://github.com/EmadEdu2033/Continuum/actions/workflows/ci.yml"><img src="https://github.com/EmadEdu2033/Continuum/actions/workflows/ci.yml/badge.svg" alt="CI status" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT license" /></a>
-  <img src="https://img.shields.io/badge/node-%3E%3D20-339933?logo=node.js&logoColor=white" alt="Node 20+" />
+  <img src="https://img.shields.io/badge/node-%3E%3D23.4-339933?logo=node.js&logoColor=white" alt="Node 23.4+" />
   <img src="https://img.shields.io/badge/platform-windows%20%7C%20linux%20%7C%20macos-blue" alt="Cross platform" />
   <img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs welcome" />
 </p>
@@ -37,8 +37,10 @@
 ## 🚀 Quickstart
 
 ```bash
-# 1. Install (from this repo)
-npm install && npm run build && npm link
+# 1. Install in one line (needs Node 23.4+ and git; builds automatically)
+npm install -g github:EmadEdu2033/Continuum
+# now `continuum` is global. From a clone instead:
+# npm install && npm run build && npm link
 
 # 2. Inside any project you want to protect
 cd my-project
@@ -56,9 +58,10 @@ continuum handoff       # latest handoff capsule
 continuum logs          # normalized event log
 continuum switch claude # start next run with claude
 continuum resume        # resume a paused task
+continuum config        # change order, models, retries without editing YAML
 ```
 
-> Offline demo? Add `--mock` to `run` / `start` / `doctor` to use scripted mock providers.
+> Offline demo? Add `--mock` to `run` / `start` / `doctor` (needs scripted providers in `.continuum/mock-providers.json`).
 
 ## 🧠 How it works
 
@@ -93,7 +96,7 @@ flowchart LR
 | OpenCode | `opencode run --format json` | `-s <id>` |
 | Antigravity | `agy -p --output-format stream-json` | `--conversation` |
 
-Uninstalled providers are skipped automatically (preflight `detect()`), never failing the run. Per-provider model overrides live in `.continuum/config.yaml`.
+Uninstalled providers are skipped automatically (preflight `detect()`), never failing the run. `doctor` also verifies Codex login via `codex login status`; other providers report auth on their first real run. Per-provider model overrides live in `.continuum/config.yaml` (or `continuum config`, no YAML editing needed).
 
 ## 🔁 Failover policy
 
@@ -118,7 +121,17 @@ Uninstalled providers are skipped automatically (preflight `detect()`), never fa
   checkpoints/         git status/diff snapshots
   sessions/            native session ids for resume
   workspace.lock       one active writer at a time
+  mock-providers.json  optional mock scripts (for --mock)
 ```
+
+## 🔧 Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `npm` not recognized (Windows) | Use `npm.cmd` — PowerShell blocks the `npm.ps1` shim by execution policy |
+| `doctor` says `auth=NO` for codex | Run `codex login`, then `continuum resume` |
+| `No providers available` with `--mock` | Add scripts to `.continuum/mock-providers.json` (one entry per provider id) |
+| Task paused after a failure | `continuum resume` retries; `continuum switch <provider>` changes the starter |
 
 ## 🗺 Roadmap
 
@@ -136,7 +149,7 @@ Uninstalled providers are skipped automatically (preflight `detect()`), never fa
 PRs welcome! Run the checks before pushing:
 
 ```bash
-npm run build && npm test   # 14 tests, must stay green
+npm run build && npm test   # 20 tests, must stay green
 ```
 
 Keep adapters isolated (no provider logic in core) and add a regression test with every failover fix.

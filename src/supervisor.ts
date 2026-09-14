@@ -10,6 +10,12 @@ export interface SupervisorEvents {
   onLog?: (line: string) => void;
 }
 
+export function fmtElapsed(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return `${s}s`;
+  return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
+}
+
 /**
  * Deterministic core runtime. No LLM anywhere in the control path: it owns
  * routing, sessions, workspace locking, checkpoints, handoff and failover.
@@ -33,8 +39,14 @@ export class Supervisor {
     const taskId = this.store.createTask(task);
     const order = this.config.routing.order.filter((id) => this.adapters.has(id));
     if (order.length === 0) {
-      throw new Error("No providers configured/available for routing");
+      throw new Error(
+        "No providers available for routing. " +
+          (this.adapters.size === 0
+            ? "No adapters were built: install a provider CLI then run `continuum doctor`, or for an offline demo add scripts to `.continuum/mock-providers.json` and use `--mock`."
+            : `Configured [${this.config.routing.order.join(", ")}] but none are registered. Run \`continuum doctor\` to check installs.`)
+      );
     }
+    const runStart = Date.now();
 
     let handoff: string | undefined;
     let lastReason: NormalizedError | undefined;
@@ -59,15 +71,20 @@ export class Supervisor {
       this.store.setProviderState(providerId, "ACTIVE", { sessionId: null });
       this.store.updateTask(taskId, { currentProvider: providerId });
       if (this.config.workspace.writer_lock) lock.acquire(providerId);
-      this.log(`${providerId} is now the active writer.`);
+      this.log(`${providerId} is now the active writer (${index + 1}/${order.length}).`);
+      const providerStart = Date.now();
+      let lastTick = providerStart;
+      let filesTouched = 0;
+      let commandsRun = 0;
 
       try {
-        // Continue the provider's native session when returning to a task it
-        // already worked on; otherwise start fresh.
+        // Continue the provider's native session only when it belongs to THIS
+        // task (retries, returns after failover). A session saved for an older
+        // task would inject stale context, so those start fresh.
         const saved = this.store.getSession(providerId);
         const input = { task, handoff, cwd: this.cwd };
         const stream =
-          handoff && saved?.sessionId
+          saved?.sessionId && saved.task === task
             ? adapter.resume(saved.sessionId, input)
             : adapter.start(input);
         for await (const event of stream) {
@@ -76,7 +93,14 @@ export class Supervisor {
             this.store.setProviderState(providerId, "ACTIVE", { sessionId: event.sessionId });
             this.store.saveSession(providerId, { sessionId: event.sessionId, task });
           }
+          if (event.type === "FileChanged") filesTouched++;
+          if (event.type === "CommandExecuted") commandsRun++;
           if (event.type === "TextDelta") this.log(event.text.replace(/\n$/, ""));
+          // Heartbeat for long runs so the terminal never looks dead.
+          if (Date.now() - lastTick > 30000) {
+            lastTick = Date.now();
+            this.log(`... still working on ${providerId} (${fmtElapsed(lastTick - providerStart)}, ${filesTouched} files, ${commandsRun} commands)`);
+          }
         }
 
         // Completed cleanly.
@@ -87,7 +111,7 @@ export class Supervisor {
         this.store.setProviderState(providerId, "READY");
         if (this.config.workspace.writer_lock) lock.release(providerId);
         this.store.updateTask(taskId, { status: "completed", finishedAt: new Date().toISOString() });
-        this.log(`Task completed by ${providerId}.`);
+        this.log(`Task completed by ${providerId} in ${fmtElapsed(Date.now() - providerStart)} (${filesTouched} files, ${commandsRun} commands, ${fmtElapsed(Date.now() - runStart)} total).`);
         return { taskId, providerId, status: "completed" };
       } catch (err) {
         const { code, message } = adapter.normalizeError(err);

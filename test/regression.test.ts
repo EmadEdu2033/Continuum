@@ -88,4 +88,74 @@ describe("regression fixes", () => {
     expect(cp.filesChanged.some((f) => f.includes(".continuum"))).toBe(false);
     store.close();
   });
+
+  it("retries within the same task resume the provider's native session", async () => {
+    const config = defaultConfig("t");
+    config.routing.order = ["provider-a"];
+    config.failover.temporary_rate_limit.max_attempts = 2;
+    const adapters = new Map();
+    adapters.set("provider-a", new MockProvider({ id: "provider-a", script: [
+      { kind: "fail", error: "TEMP_RATE_LIMIT", message: "429" },
+      { kind: "writeFile", path: "done.txt", content: "ok\n" },
+    ]}));
+
+    const store = new Store(root);
+    const supervisor = new Supervisor(adapters, config, store, root);
+    const result = await supervisor.run("retry task");
+    expect(result.status).toBe("completed");
+
+    // Both attempts (SessionStarted per attempt) must carry the same id.
+    const starts = store
+      .readEvents()
+      .filter((e) => e.type === "SessionStarted" && e.providerId === "provider-a");
+    expect(starts.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(starts.map((s: any) => s.sessionId)).size).toBe(1);
+    store.close();
+  });
+
+  it("never resumes a session saved for a different task", async () => {
+    const config = defaultConfig("t");
+    config.routing.order = ["provider-a", "provider-b"];
+    const adapters = new Map();
+
+    const store = new Store(root);
+    // Task 1: provider-a completes and its session id is stored.
+    adapters.set("provider-a", new MockProvider({ id: "provider-a", script: [
+      { kind: "say", text: "first" },
+    ]}));
+    await new Supervisor(adapters, config, store, root).run("first task");
+    const firstSession = store.readEvents().find(
+      (e) => e.type === "SessionStarted" && e.providerId === "provider-a"
+    )!;
+
+    // Task 2 (different text): provider-a must START FRESH, not resume task 1's session.
+    adapters.set("provider-a", new MockProvider({ id: "provider-a", script: [
+      { kind: "fail", error: "QUOTA_EXHAUSTED", message: "limit" },
+    ]}));
+    adapters.set("provider-b", new MockProvider({ id: "provider-b", script: [
+      { kind: "say", text: "done" },
+    ]}));
+    await new Supervisor(adapters, config, store, root).run("second task");
+
+    const secondSession = store
+      .readEvents()
+      .filter((e: any) => e.type === "SessionStarted" && e.providerId === "provider-a" && e.taskId === 2)[0];
+    expect(secondSession).toBeTruthy();
+    expect((secondSession as any).sessionId).not.toBe((firstSession as any).sessionId);
+    store.close();
+  });
+
+  it("mock mode never invents idle mocks for unscripted providers", async () => {
+    // Only scripted providers may exist; an empty/idle mock would "complete"
+    // tasks while doing nothing.
+    const { buildAdapters } = await import("../src/adapters/registry.js");
+    fs.writeFileSync(
+      path.join(root, ".continuum", "mock-providers.json"),
+      JSON.stringify([{ id: "codex", script: [{ kind: "say", text: "hi" }] }]),
+      "utf8"
+    );
+    const config = defaultConfig("t"); // order: codex, claude, opencode, antigravity
+    const adapters = buildAdapters(root, config, { real: false });
+    expect([...adapters.keys()]).toEqual(["codex"]);
+  });
 });
