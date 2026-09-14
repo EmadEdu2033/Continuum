@@ -401,6 +401,8 @@ program
       }
       console.log(`\nOrder: ${config.routing.order.join(" -> ")}`);
       console.log(`Running. On quota/limit: checkpoint + handoff capsule + next provider.\n`);
+      // Release stdin from readline before the dashboard claims it for raw mode.
+      rl.close();
       await executeRun(root, task, config, { mock: Boolean(opts.mock), tui: true });
     } catch (err: any) {
       console.error(err?.message ?? String(err));
