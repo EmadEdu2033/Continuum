@@ -151,9 +151,16 @@ export class Dashboard {
     this.flushFinal();
   }
 
-  /** After leaving the alternate screen, replay the important lines inline. */
+  /**
+   * After leaving the alternate screen, print only the final status lines.
+   * The full transcript is already in `continuum logs`; replaying it here just
+   * duplicates the result summary.
+   */
   private flushFinal(): void {
-    const tail = this.logs.slice(-8);
+    if (this.snapshot.lastError) {
+      write(`${this.snapshot.lastError.code}: ${this.snapshot.lastError.message}\n`);
+    }
+    const tail = this.logs.slice(-2);
     for (const l of tail) write(`${l}\n`);
   }
 }
